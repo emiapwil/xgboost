@@ -27,7 +27,9 @@ class FeatureMap {
     kQuantitive = 1,
     kInteger = 2,
     kFloat = 3,
-    kCategorical = 4
+    kCategorical = 4,
+    /* PSPLIT: Add support for IP address feature */
+    kIpAddress = 5
   };
   /*!
    * \brief load feature map from input stream
@@ -84,6 +86,10 @@ class FeatureMap {
     if (!strcmp("int", tname)) return kInteger;
     if (!strcmp("float", tname)) return kFloat;
     if (!strcmp("c", tname)) return kCategorical;
+    if (!strcmp("categorical", tname)) return kCategorical;
+    /* PSPLIT: Add support for IP address feature */
+    if (!strcmp("ipv4", tname)) return kIpAddress;
+    if (!strcmp("ipv6", tname)) return kIpAddress;
     LOG(FATAL) << "unknown feature type, use i for indicator and q for quantity";
     return kIndicator;
   }

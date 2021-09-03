@@ -1159,13 +1159,17 @@ class LearnerImpl : public LearnerIO {
     this->Configure();
     CHECK_LE(multiple_predictions, 1) << "Perform one kind of prediction at a time.";
     if (pred_contribs) {
+      LOG(WARNING) << "here";
       gbm_->PredictContribution(data.get(), out_preds, layer_begin, layer_end, approx_contribs);
     } else if (pred_interactions) {
+      LOG(WARNING) << "here";
       gbm_->PredictInteractionContributions(data.get(), out_preds, layer_begin, layer_end,
                                             approx_contribs);
     } else if (pred_leaf) {
+      LOG(WARNING) << "here";
       gbm_->PredictLeaf(data.get(), out_preds, layer_begin, layer_end);
     } else {
+      LOG(WARNING) << "here";
       auto local_cache = this->GetPredictionCache();
       auto& prediction = local_cache->Cache(data, generic_parameters_.gpu_id);
       this->PredictRaw(data.get(), &prediction, training, layer_begin, layer_end);

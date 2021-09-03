@@ -354,6 +354,7 @@ def _wrap_evaluation_matrices(
     sample_weight: Optional[Any],
     base_margin: Optional[Any],
     feature_weights: Optional[Any],
+    feature_types: Optional[Any],
     eval_set: Optional[Sequence[Tuple[Any, Any]]],
     sample_weight_eval_set: Optional[Sequence[Any]],
     base_margin_eval_set: Optional[Sequence[Any]],
@@ -373,6 +374,7 @@ def _wrap_evaluation_matrices(
         weight=sample_weight,
         base_margin=base_margin,
         feature_weights=feature_weights,
+        feature_types=feature_types,
         missing=missing,
         enable_categorical=enable_categorical,
     )
@@ -422,6 +424,7 @@ def _wrap_evaluation_matrices(
                     base_margin=base_margin_eval_set[i],
                     missing=missing,
                     enable_categorical=enable_categorical,
+                    feature_types=feature_types,
                 )
                 evals.append(m)
         nevals = len(evals)
@@ -1260,6 +1263,7 @@ class XGBClassifier(XGBModel, XGBClassifierBase):
         sample_weight_eval_set: Optional[Sequence[array_like]] = None,
         base_margin_eval_set: Optional[Sequence[array_like]] = None,
         feature_weights: Optional[array_like] = None,
+        feature_types: Optional[array_like] = None,
         callbacks: Optional[Sequence[TrainingCallback]] = None
     ) -> "XGBClassifier":
         # pylint: disable = attribute-defined-outside-init,too-many-statements
@@ -1319,6 +1323,7 @@ class XGBClassifier(XGBModel, XGBClassifierBase):
             sample_weight=sample_weight,
             base_margin=base_margin,
             feature_weights=feature_weights,
+            feature_types=feature_types,
             eval_set=eval_set,
             sample_weight_eval_set=sample_weight_eval_set,
             base_margin_eval_set=base_margin_eval_set,

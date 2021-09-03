@@ -425,6 +425,30 @@ class RegTree : public Model {
                   bst_node_t leaf_right_child = kInvalidNodeId);
 
   /**
+   * \brief Expands a leaf node into two additional leaf nodes with prefix splitting.
+   *
+   * \param nid               The node index to expand.
+   * \param split_index       Feature index of the split.
+   * \param split_value       The split condition.
+   * \param default_left      True to default left.
+   * \param base_weight       The base weight, before learning rate.
+   * \param left_leaf_weight  The left leaf weight for prediction, modified by learning rate.
+   * \param right_leaf_weight The right leaf weight for prediction, modified by learning rate.
+   * \param loss_change       The loss change.
+   * \param sum_hess          The sum hess.
+   * \param left_sum          The sum hess of left leaf.
+   * \param right_sum         The sum hess of right leaf.
+   * \param leaf_right_child  The right child index of leaf, by default kInvalidNodeId,
+   *                          some updaters use the right child index of leaf as a marker
+   */
+  void ExpandPrefix(bst_node_t nid, unsigned split_index, bst_float split_value,
+                    bool default_left, bst_float base_weight,
+                    bst_float left_leaf_weight, bst_float right_leaf_weight,
+                    bst_float loss_change, float sum_hess, float left_sum,
+                    float right_sum,
+                    bst_node_t leaf_right_child = kInvalidNodeId);
+
+  /**
    * \brief Expands a leaf node with categories
    *
    * \param nid               The node index to expand.

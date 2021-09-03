@@ -38,7 +38,8 @@ enum class DataType : uint8_t {
 
 enum class FeatureType : uint8_t {
   kNumerical,
-  kCategorical
+  kCategorical,
+  kIPAddr
 };
 
 /*!
