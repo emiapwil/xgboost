@@ -5,20 +5,32 @@
  * \author Kai Gao
  */
 
+#pragma once
+
 #include "xgboost/base.h"
 #include "xgboost/data.h"
 
 namespace xgboost {
-namespace tree {
 
   static constexpr int kMaxPrefixLen = 32;
 
-  struct Prefix {
-    bst_ulong pvalue {0};
-    int masklen {0};
+  inline uint32_t clear_lower_bits(uint32_t addr, uint8_t masklen) {
+    if (masklen == 32) {
+      return 0;
+    }
+    return (addr >> masklen) << masklen;
+  }
 
-    inline bool Match(bst_ulong addr) const {
-      return ((addr ^ pvalue) >> masklen) == 0;
+  struct Prefix {
+    uint32_t pvalue {0};
+    uint8_t masklen {0};
+
+    inline uint32_t ClearLowerBits() const {
+      return pvalue;
+    }
+
+    inline bool Match(uint32_t addr) const {
+      return pvalue == clear_lower_bits(addr, masklen);
     }
 
     inline bool Match(const Prefix & rhs) const {
@@ -26,7 +38,7 @@ namespace tree {
         (Match(rhs.pvalue));
     }
 
-    inline Prefix Merge(const Prefix &rhs) {
+    inline Prefix Merge(const Prefix &rhs) const {
       Prefix prefix(pvalue, masklen);
       prefix.Update(rhs);
       return prefix;
@@ -36,28 +48,19 @@ namespace tree {
       if (rhs.masklen > masklen) {
         masklen = rhs.masklen;
       }
-      while ((pvalue ^ rhs.pvalue) >> masklen) {
+      while (clear_lower_bits(pvalue, masklen) !=
+             clear_lower_bits(rhs.pvalue, masklen)) {
         masklen++;
       }
-    }
-
-    inline bst_float Encode() {
-      return (pvalue << 6) + masklen;
-    }
-
-    inline void Decode(bst_float fvalue) {
-      bst_ulong encoded = static_cast<bst_ulong>(fvalue);
-      masklen = static_cast<int>(encoded & 63);
-      pvalue = encoded >> 6;
+      pvalue = clear_lower_bits(pvalue, masklen);
     }
 
     Prefix() = default;
 
-    Prefix(bst_ulong pvalue_, int masklen_)
-      : pvalue(pvalue_), masklen(masklen_) {}
+    Prefix(uint32_t pvalue_, uint8_t masklen_)
+      : pvalue(clear_lower_bits(pvalue_, masklen_)), masklen(masklen_) {}
 
     Prefix(const Prefix & rhs): pvalue(rhs.pvalue), masklen(rhs.masklen) {}
   };
 
-} // namespace tree
 } // namespace xgboost

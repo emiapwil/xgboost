@@ -5,7 +5,7 @@
 #define XGBOOST_PREDICTOR_PREDICT_FN_H_
 #include "../common/categorical.h"
 #include "xgboost/tree_model.h"
-#include "../tree/prefix.h"
+#include "xgboost/prefix.h"
 
 namespace xgboost {
 namespace predictor {
@@ -23,12 +23,14 @@ GetNextNode(const RegTree::Node &node, const bst_node_t nid, float fvalue,
                  ? node.LeftChild()
                  : node.RightChild();
     } else if (cats.split_type[nid] == FeatureType::kIPAddr) {
-      tree::Prefix prefix;
-      prefix.Decode(node.SplitCond());
-      bst_ulong addr = static_cast<bst_ulong>(fvalue);
-      LOG(WARNING) << "prefix: " << prefix.pvalue << "/"
-                   << 32 - prefix.masklen << " match " << addr
-                   << " = " << prefix.Match(addr);
+      Prefix prefix(node.SplitPrefix(), node.SplitMaskLen());
+      LOG(DEBUG) << &node;
+      LOG(DEBUG) << std::hex << node.sindex_;
+      uint32_t addr = static_cast<uint32_t>(fvalue);
+      LOG(DEBUG) << "prefix: " << prefix.pvalue << "/"
+                 << 32 - prefix.masklen << " match " << addr
+                 << " = " << prefix.Match(addr)
+                 << " at node #" << nid;
       return node.LeftChild() + !(prefix.Match(addr));
     } else {
       return node.LeftChild() + !(fvalue < node.SplitCond());

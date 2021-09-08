@@ -494,6 +494,7 @@ class XGBModel(XGBModelBase):
                 "sklearn needs to be installed in order to use this module"
             )
         self.n_estimators = n_estimators
+        print("n_estimators: %d" % self.n_estimators)
         self.objective = objective
 
         self.max_depth = max_depth
@@ -1333,6 +1334,7 @@ class XGBClassifier(XGBModel, XGBClassifierBase):
             enable_categorical=self.enable_categorical,
         )
 
+        print(self.get_num_boosting_rounds())
         self._Booster = train(
             params,
             train_dmatrix,

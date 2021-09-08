@@ -552,7 +552,6 @@ GBTree::GetPredictor(HostDeviceVector<float> const *out_pred,
       common::AssertOneAPISupport();
 #endif  // defined(XGBOOST_USE_ONEAPI)
     }
-    LOG(WARNING) << "here";
     CHECK(cpu_predictor_);
     return cpu_predictor_;
   }

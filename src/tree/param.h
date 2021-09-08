@@ -18,6 +18,7 @@
 #include "xgboost/data.h"
 #include "../common/categorical.h"
 #include "../common/math.h"
+#include "xgboost/prefix.h"
 
 namespace xgboost {
 namespace tree {
@@ -391,9 +392,13 @@ struct SplitEntryContainer {
   bst_float loss_chg {0.0f};
   /*! \brief split index */
   bst_feature_t sindex{0};
+
+  FeatureType split_type {FeatureType::kNumerical};
+
   bst_float split_value{0.0f};
   std::vector<uint32_t> cat_bits;
   bool is_cat{false};
+  Prefix split_prefix;
 
   GradientT left_sum;
   GradientT right_sum;
@@ -445,6 +450,13 @@ struct SplitEntryContainer {
       this->split_value = e.split_value;
       this->is_cat = e.is_cat;
       this->cat_bits = e.cat_bits;
+
+      this->split_type = e.split_type;
+      if (this->split_type == FeatureType::kIPAddr) {
+        this->split_prefix = e.split_prefix;
+      } else {
+        this->split_value = e.split_value;
+      }
       this->left_sum = e.left_sum;
       this->right_sum = e.right_sum;
       return true;
@@ -469,6 +481,7 @@ struct SplitEntryContainer {
         split_index |= (1U << 31);
       }
       this->sindex = split_index;
+      this->split_type = FeatureType::kNumerical;
       this->split_value = new_split_value;
       this->is_cat = is_cat;
       this->left_sum = left_sum;
@@ -502,6 +515,35 @@ struct SplitEntryContainer {
       return false;
     }
   }
+
+  /*!
+   * \brief update the split entry, replace it if e is better
+   * \param new_loss_chg loss reduction of new candidate
+   * \param split_index feature index to split on
+   * \param new_split_value the split point
+   * \param default_left whether the missing value goes to left
+   * \return whether the proposed split is better and can replace current split
+   */
+  bool Update(bst_float new_loss_chg, unsigned split_index,
+              Prefix new_split_prefix, bool default_left,
+              const GradientT &left_sum,
+              const GradientT &right_sum) {
+    if (this->NeedReplace(new_loss_chg, split_index)) {
+      this->loss_chg = new_loss_chg;
+      if (default_left) {
+        split_index |= (1U << 31);
+      }
+      this->sindex = split_index;
+      this->split_type = FeatureType::kIPAddr;
+      this->split_prefix = new_split_prefix;
+      this->left_sum = left_sum;
+      this->right_sum = right_sum;
+      return true;
+    } else {
+      return false;
+    }
+  }
+
 
   /*! \brief same as update, used by AllReduce*/
   inline static void Reduce(SplitEntryContainer &dst,         // NOLINT(*)
