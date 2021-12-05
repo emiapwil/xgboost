@@ -413,10 +413,8 @@ class ColMaker: public TreeUpdater {
                              << " loss_chg " << loss_chg;
               }
             }
-            Prefix candidate = pl.prefix.Merge(p);
-            LOG(DEBUG) << "potential prefix: " << candidate.ClearLowerBits()
-                         << "/" << 32 - candidate.masklen;
-            if (ps.CanPush(candidate)) {
+            if (ps.CanPush(p)) {
+              Prefix candidate = pl.prefix.Merge(p);
               ps.Push(PrefixStats(pl.stats, candidate));
             } else {
               ps.Top().stats.Add(pl.stats);

@@ -122,7 +122,8 @@ class TreeGenerator {
       auto check_prefix = [&]() {
         CHECK(is_prefix)
           << fmap_.Name(split_index)
-          << " in feature map is categorical/numerical but tree node is prefix";
+          << " in feature map is "
+          << fmap_.TypeOf(split_index) << " but tree node is prefix";
       };
 
       switch (fmap_.TypeOf(split_index)) {

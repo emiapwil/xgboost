@@ -495,6 +495,8 @@ class XGBModel(XGBModelBase):
             )
         self.n_estimators = n_estimators
         print("n_estimators: %d" % self.n_estimators)
+        print(enable_categorical)
+
         self.objective = objective
 
         self.max_depth = max_depth
@@ -834,6 +836,7 @@ class XGBModel(XGBModelBase):
         sample_weight_eval_set: Optional[Sequence[array_like]] = None,
         base_margin_eval_set: Optional[Sequence[array_like]] = None,
         feature_weights: Optional[array_like] = None,
+        feature_types: Optional[array_like] = None,
         callbacks: Optional[Sequence[TrainingCallback]] = None
     ) -> "XGBModel":
         # pylint: disable=invalid-name,attribute-defined-outside-init
@@ -898,6 +901,7 @@ class XGBModel(XGBModelBase):
             sample_weight=sample_weight,
             base_margin=base_margin,
             feature_weights=feature_weights,
+            feature_types=feature_types,
             eval_set=eval_set,
             sample_weight_eval_set=sample_weight_eval_set,
             base_margin_eval_set=base_margin_eval_set,
@@ -906,6 +910,7 @@ class XGBModel(XGBModelBase):
             create_dmatrix=lambda **kwargs: DMatrix(nthread=self.n_jobs, **kwargs),
             enable_categorical=self.enable_categorical,
         )
+        print(train_dmatrix.feature_types)
         params = self.get_xgb_params()
 
         if callable(self.objective):
