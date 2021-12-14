@@ -511,7 +511,7 @@ class ColMaker: public TreeUpdater {
       }
 
       // local cache buffer for prefix starting index and gradient stats
-      bst_ulong buf_fvalue[kBuffer] = {};
+      bst_float buf_fvalue[kBuffer] = {};
       int buf_masklen[kBuffer] = {};
 
       int i;
@@ -521,6 +521,7 @@ class ColMaker: public TreeUpdater {
       for (it = begin; it != align_end; it += align_step) {
         const Entry *p;
         for (i = 0, p = it; i < kBuffer; ++i, p += d_step) {
+          buf_fvalue[i] = p->fvalue;
           buf_position[i] = position_[p->index];
           buf_gpair[i] = gpair[p->index];
         }
@@ -528,10 +529,10 @@ class ColMaker: public TreeUpdater {
           const int nid = buf_position[i];
           if (nid < 0 || !interaction_constraints_.Query(nid, fid)) { continue; }
           if (prefix_split) {
-            this->UpdatePrefixEnumeration(nid, buf_gpair[i], p->fvalue, d_step,
+            this->UpdatePrefixEnumeration(nid, buf_gpair[i], buf_fvalue[i], d_step,
                                           fid, c, temp, pstack, evaluator);
           } else {
-            this->UpdateEnumeration(nid, buf_gpair[i], p->fvalue, d_step,
+            this->UpdateEnumeration(nid, buf_gpair[i], buf_fvalue[i], d_step,
                                     fid, c, temp, evaluator);
           }
         }
