@@ -124,6 +124,11 @@ struct RTreeNodeStat {
   }
 };
 
+static constexpr uint32_t DEFAULT_LEFT_MASK = 1U << 31;
+static constexpr uint32_t SPLIT_PREFIX_MASK = 1U << 30;
+static constexpr uint32_t MASKLEN_MASK = ((1U << 8) - 1) << 22;
+static constexpr uint32_t MASKLEN_OFFSET = 22;
+static constexpr uint32_t SPLIT_INDEX_MASK = (1U << 22) - 1;
 /*!
  * \brief define regression tree to be the most common tree model.
  *  This is the data structure used in xgboost's major tree models.
@@ -149,6 +154,13 @@ class RegTree : public Model {
       this->SetParent(parent_);
       this->SetSplit(split_ind, split_cond, default_left);
     }
+    Node(int32_t cleft, int32_t cright, int32_t parent,
+         uint32_t split_ind, uint32_t split_prefix,
+         uint8_t masklen, bool default_left) :
+      parent_{parent}, cleft_{cleft}, cright_{cright} {
+      this->SetParent(parent_);
+      this->SetSplit(split_ind, split_prefix, masklen, default_left);
+    }
 
     /*! \brief index of left child */
     XGBOOST_DEVICE int LeftChild() const {
@@ -164,11 +176,11 @@ class RegTree : public Model {
     }
     /*! \brief feature index of split condition */
     XGBOOST_DEVICE unsigned SplitIndex() const {
-      return sindex_ & ((1U << 31) - 1U);
+      return sindex_ & SPLIT_INDEX_MASK;
     }
     /*! \brief when feature is unknown, whether goes to left child */
     XGBOOST_DEVICE bool DefaultLeft() const {
-      return (sindex_ >> 31) != 0;
+      return (sindex_ & DEFAULT_LEFT_MASK) != 0;
     }
     /*! \brief whether current node is leaf node */
     XGBOOST_DEVICE bool IsLeaf() const {
@@ -178,9 +190,20 @@ class RegTree : public Model {
     XGBOOST_DEVICE bst_float LeafValue() const {
       return (this->info_).leaf_value;
     }
+    /*! \return whether current node is split by prefix */
+    XGBOOST_DEVICE bool IsSplitByPrefix() const {
+      return (this->sindex_ & SPLIT_PREFIX_MASK) != 0;
+    }
     /*! \return get split condition of the node */
     XGBOOST_DEVICE SplitCondT SplitCond() const {
       return (this->info_).split_cond;
+    }
+    /*! \return get split prefix of the node */
+    XGBOOST_DEVICE uint32_t SplitPrefix() const {
+      return (this->info_).split_prefix;
+    }
+    XGBOOST_DEVICE uint32_t SplitMaskLen() const {
+      return (this->sindex_ & MASKLEN_MASK) >> MASKLEN_OFFSET;
     }
     /*! \brief get parent of the node */
     XGBOOST_DEVICE int Parent() const {
@@ -218,9 +241,17 @@ class RegTree : public Model {
      */
     XGBOOST_DEVICE void SetSplit(unsigned split_index, SplitCondT split_cond,
                           bool default_left = false) {
-      if (default_left) split_index |= (1U << 31);
+      if (default_left) split_index |= DEFAULT_LEFT_MASK;
       this->sindex_ = split_index;
       (this->info_).split_cond = split_cond;
+    }
+    XGBOOST_DEVICE void SetSplit(unsigned split_index, uint32_t split_prefix,
+                                 uint8_t masklen, bool default_left = false) {
+      if (default_left) split_index |= DEFAULT_LEFT_MASK;
+      split_index |= SPLIT_PREFIX_MASK;
+      split_index |= (static_cast<uint32_t>(masklen) << MASKLEN_OFFSET);
+      this->sindex_ = split_index;
+      (this->info_).split_prefix = split_prefix;
     }
     /*!
      * \brief set the leaf value of the node
@@ -262,6 +293,7 @@ class RegTree : public Model {
       return x;
     }
 
+    uint32_t sindex_{0};
    private:
     /*!
      * \brief in leaf node, we have weights, in non-leaf nodes,
@@ -270,6 +302,7 @@ class RegTree : public Model {
     union Info{
       bst_float leaf_value;
       SplitCondT split_cond;
+      uint32_t split_prefix;
     };
     // pointer to parent, highest bit is used to
     // indicate whether it's a left child or not
@@ -277,7 +310,7 @@ class RegTree : public Model {
     // pointer to left, right
     int32_t cleft_{kInvalidNodeId}, cright_{kInvalidNodeId};
     // split feature index, left split or right split depends on the highest bit
-    uint32_t sindex_{0};
+    // split on prefix or numerical depends on the second highest bit
     // extra info
     Info info_;
   };
@@ -423,6 +456,31 @@ class RegTree : public Model {
                   bst_float loss_change, float sum_hess, float left_sum,
                   float right_sum,
                   bst_node_t leaf_right_child = kInvalidNodeId);
+
+  /**
+   * \brief Expands a leaf node into two additional leaf nodes with prefix splitting.
+   *
+   * \param nid               The node index to expand.
+   * \param split_index       Feature index of the split.
+   * \param split_value       The split condition.
+   * \param default_left      True to default left.
+   * \param base_weight       The base weight, before learning rate.
+   * \param left_leaf_weight  The left leaf weight for prediction, modified by learning rate.
+   * \param right_leaf_weight The right leaf weight for prediction, modified by learning rate.
+   * \param loss_change       The loss change.
+   * \param sum_hess          The sum hess.
+   * \param left_sum          The sum hess of left leaf.
+   * \param right_sum         The sum hess of right leaf.
+   * \param leaf_right_child  The right child index of leaf, by default kInvalidNodeId,
+   *                          some updaters use the right child index of leaf as a marker
+   */
+  void ExpandPrefix(bst_node_t nid, unsigned split_index,
+                    uint32_t split_prefix, uint8_t masklen,
+                    bool default_left, bst_float base_weight,
+                    bst_float left_leaf_weight, bst_float right_leaf_weight,
+                    bst_float loss_change, float sum_hess, float left_sum,
+                    float right_sum,
+                    bst_node_t leaf_right_child = kInvalidNodeId);
 
   /**
    * \brief Expands a leaf node with categories

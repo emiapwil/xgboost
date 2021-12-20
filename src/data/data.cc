@@ -202,6 +202,8 @@ void LoadFeatureType(std::vector<std::string>const& type_names, std::vector<Feat
       types->emplace_back(FeatureType::kNumerical);
     } else if (elem == "c") {
       types->emplace_back(FeatureType::kCategorical);
+    } else if (elem == "ipv4") {
+      types->emplace_back(FeatureType::kIPAddr);
     } else {
       LOG(FATAL) << "All feature_types must be one of {int, float, i, q, c}.";
     }

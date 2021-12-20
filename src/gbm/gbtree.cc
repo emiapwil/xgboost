@@ -184,6 +184,10 @@ void GBTree::ConfigureUpdaters() {
       tparam_.updater_seq = "grow_gpu_hist";
       break;
     }
+    case TreeMethod::kPrefix: {
+      tparam_.updater_seq = "grow_colmaker,prune";
+      //LOG(FATAL) << "Prefix updater is not fully supported";
+    }
     default:
       LOG(FATAL) << "Unknown tree_method ("
                  << static_cast<int>(tparam_.tree_method) << ") detected";

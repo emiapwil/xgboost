@@ -86,14 +86,27 @@ class TreeGenerator {
   virtual std::string NodeStat(RegTree const& /*tree*/, int32_t /*nid*/) const {
     return "";
   }
+  virtual std::string Prefix(RegTree const & /*tree*/,
+                             int32_t /*nid*/, uint32_t /*depth*/) const {
+    return "";
+  }
 
   virtual std::string PlainNode(RegTree const& /*tree*/,
                                 int32_t /*nid*/, uint32_t /*depth*/) const = 0;
+
+  std::string DecodeIPv4(uint32_t ip) const {
+    uint8_t* const segments = reinterpret_cast<uint8_t* const>(&ip);
+    return std::to_string(static_cast<uint32_t>(segments[3])) + "." +
+      std::to_string(static_cast<uint32_t>(segments[2])) + "." +
+      std::to_string(static_cast<uint32_t>(segments[1])) + "." +
+      std::to_string(static_cast<uint32_t>(segments[0]));
+  }
 
   virtual std::string SplitNode(RegTree const& tree, int32_t nid, uint32_t depth) {
     auto const split_index = tree[nid].SplitIndex();
     std::string result;
     auto is_categorical = tree.GetSplitTypes()[nid] == FeatureType::kCategorical;
+    auto is_prefix = tree.GetSplitTypes()[nid] == FeatureType::kIPAddr;
     if (split_index < fmap_.Size()) {
       auto check_categorical = [&]() {
         CHECK(is_categorical)
@@ -105,6 +118,12 @@ class TreeGenerator {
         CHECK(is_numerical)
             << fmap_.Name(split_index)
             << " in feature map is categorical but tree node is numerical.";
+      };
+      auto check_prefix = [&]() {
+        CHECK(is_prefix)
+          << fmap_.Name(split_index)
+          << " in feature map is "
+          << fmap_.TypeOf(split_index) << " but tree node is prefix";
       };
 
       switch (fmap_.TypeOf(split_index)) {
@@ -127,6 +146,11 @@ class TreeGenerator {
       case FeatureMap::kQuantitive: {
         check_numerical();
         result = this->Quantitive(tree, nid, depth);
+        break;
+      }
+      case FeatureMap::kIpAddress: {
+        check_prefix();
+        result = this->Prefix(tree, nid, depth);
         break;
       }
       default:
@@ -294,6 +318,15 @@ class TextGenerator : public TreeGenerator {
         : static_cast<int>(floored) + 1;
     return SplitNodeImpl(tree, nid, kIntegerTemplate,
                          std::to_string(integer_threshold), depth);
+  }
+
+  std::string Prefix(RegTree const& tree, int32_t nid, uint32_t depth) const override {
+    static std::string const kPrefixTemplate =
+        "{tabs}{nid}:[{fname} in {cond}] yes={left},no={right},missing={missing}";
+    auto prefix = tree[nid].SplitPrefix();
+    auto masklen = 32 - tree[nid].SplitMaskLen();
+    auto cond = DecodeIPv4(prefix) + "/" + std::to_string(masklen);
+    return SplitNodeImpl(tree, nid, kPrefixTemplate, cond, depth);
   }
 
   std::string Quantitive(RegTree const& tree, int32_t nid, uint32_t depth) const override {
@@ -660,6 +693,27 @@ class GraphvizGenerator : public TreeGenerator {
     return result;
   };
 
+  std::string Prefix(RegTree const& tree, int32_t nid, uint32_t) const override {
+    auto split = tree[nid].SplitIndex();
+    auto prefix = tree[nid].SplitPrefix();
+    auto masklen = tree[nid].SplitMaskLen();
+    static std::string const kPrefixNodeTemplate =
+      "    {nid} [ label=\"{fname} in {cond}\" {params}]\n";
+
+    // Indicator only has fname.
+    std::string result = SuperT::Match(kPrefixNodeTemplate, {
+        {"{nid}",    std::to_string(nid)},
+        {"{fname}",  split < fmap_.Size() ? fmap_.Name(split) :
+         'f' + std::to_string(split)},
+        {"{cond}",   DecodeIPv4(prefix) + "/" + std::to_string(masklen)},
+        {"{params}", param_.condition_node_params}});
+
+    result += BuildEdge<false>(tree, nid, tree[nid].LeftChild(), true);
+    result += BuildEdge<false>(tree, nid, tree[nid].RightChild(), false);
+
+    return result;
+  };
+
   std::string Categorical(RegTree const& tree, int32_t nid, uint32_t) const override {
     static std::string const kLabelTemplate =
         "    {nid} [ label=\"{fname}:{cond}\" {params}]\n";
@@ -695,9 +749,17 @@ class GraphvizGenerator : public TreeGenerator {
       return this->LeafNode(tree, nid, depth);
     }
     static std::string const kNodeTemplate = "{parent}\n{left}\n{right}";
-    auto node = tree.GetSplitTypes()[nid] == FeatureType::kCategorical
-                    ? this->Categorical(tree, nid, depth)
-                    : this->PlainNode(tree, nid, depth);
+    std::string node;
+    switch (tree.GetSplitTypes()[nid]) {
+    case FeatureType::kCategorical:
+      node = this->Categorical(tree, nid, depth);
+      break;
+    case FeatureType::kIPAddr:
+      node = this->Prefix(tree, nid, depth);
+      break;
+    default:
+      node = this->PlainNode(tree, nid, depth);
+    }
     auto result = SuperT::Match(
         kNodeTemplate,
         {{"{parent}", node},
@@ -805,6 +867,39 @@ void RegTree::ExpandNode(bst_node_t nid, unsigned split_index, bst_float split_v
   this->Stat(pright) = {0.0f, right_sum, right_leaf_weight};
 
   this->split_types_.at(nid) = FeatureType::kNumerical;
+}
+
+void RegTree::ExpandPrefix(bst_node_t nid, unsigned split_index,
+                           uint32_t split_prefix, uint8_t split_masklen,
+                           bool default_left, bst_float base_weight,
+                           bst_float left_leaf_weight,
+                           bst_float right_leaf_weight, bst_float loss_change,
+                           float sum_hess, float left_sum, float right_sum,
+                           bst_node_t leaf_right_child) {
+  int pleft = this->AllocNode();
+  int pright = this->AllocNode();
+  auto &node = nodes_[nid];
+  CHECK(node.IsLeaf());
+  node.SetLeftChild(pleft);
+  node.SetRightChild(pright);
+  nodes_[node.LeftChild()].SetParent(nid, true);
+  nodes_[node.RightChild()].SetParent(nid, false);
+  node.SetSplit(split_index, split_prefix, split_masklen, default_left);
+
+  LOG(DEBUG) << &node;
+  LOG(DEBUG) << node.SplitPrefix() << "/" << 32 - node.SplitMaskLen();
+  LOG(DEBUG) << std::hex << node.sindex_;
+  LOG(DEBUG) << node.SplitMaskLen() << " = "
+             << static_cast<uint32_t>(split_masklen) << "?";
+
+  nodes_[pleft].SetLeaf(left_leaf_weight, leaf_right_child);
+  nodes_[pright].SetLeaf(right_leaf_weight, leaf_right_child);
+
+  this->Stat(nid) = {loss_change, sum_hess, base_weight};
+  this->Stat(pleft) = {0.0f, left_sum, left_leaf_weight};
+  this->Stat(pright) = {0.0f, right_sum, right_leaf_weight};
+
+  this->split_types_.at(nid) = FeatureType::kIPAddr;
 }
 
 void RegTree::ExpandCategorical(bst_node_t nid, unsigned split_index,
@@ -1032,9 +1127,17 @@ void RegTree::LoadModel(Json const& in) {
     bst_node_t right = get<Integer const>(rights[i]);
     bst_node_t parent = get<Integer const>(parents[i]);
     bst_feature_t ind = get<Integer const>(indices[i]);
-    float cond { get<Number const>(conds[i]) };
     bool dft_left { get<Boolean const>(default_left[i]) };
-    n = Node{left, right, parent, ind, cond, dft_left};
+    if (conds[i].GetValue().Type() == Value::ValueKind::kObject) {
+      auto const& obj = get<Object const>(conds[i]);
+      uint32_t prefix = get<Integer const>(obj.at("prefix"));
+      uint8_t masklen = static_cast<uint8_t>(
+                            get<Integer const>(obj.at("masklen")));
+      n = Node {left, right, parent, ind, prefix, masklen, dft_left};
+    } else {
+      float cond { get<Number const>(conds[i]) };
+      n = Node{left, right, parent, ind, cond, dft_left};
+    }
 
     if (has_cat) {
       split_types_[i] =
@@ -1107,7 +1210,14 @@ void RegTree::SaveModel(Json* p_out) const {
     rights[i] = static_cast<I>(n.RightChild());
     parents[i] = static_cast<I>(n.Parent());
     indices[i] = static_cast<I>(n.SplitIndex());
-    conds[i] = n.SplitCond();
+    if (n.IsSplitByPrefix()) {
+      std::map<std::string, Json> obj;
+      obj["prefix"] = static_cast<I>(n.SplitPrefix());
+      obj["masklen"] = static_cast<I>(n.SplitMaskLen());
+      conds[i] = std::move(obj);
+    } else {
+      conds[i] = n.SplitCond();
+    }
     default_left[i] = n.DefaultLeft();
 
     split_type[i] = static_cast<I>(this->NodeSplitType(i));

@@ -14,6 +14,7 @@
 #include "xgboost/tree_updater.h"
 #include "xgboost/logging.h"
 #include "xgboost/json.h"
+#include "xgboost/prefix.h"
 #include "param.h"
 #include "constraints.h"
 #include "../common/random.h"
@@ -27,11 +28,15 @@ DMLC_REGISTRY_FILE_TAG(updater_colmaker);
 struct ColMakerTrainParam : XGBoostParameter<ColMakerTrainParam> {
   // speed optimization for dense column
   float opt_dense_col;
+  bool enable_prefix_split;
   DMLC_DECLARE_PARAMETER(ColMakerTrainParam) {
     DMLC_DECLARE_FIELD(opt_dense_col)
         .set_range(0.0f, 1.0f)
         .set_default(1.0f)
         .describe("EXP Param: speed optimization for dense column.");
+    DMLC_DECLARE_FIELD(enable_prefix_split)
+      .set_default(false)
+      .describe("EXP Param: enable prefix-based splitting.");
   }
 
   /*! \brief whether need forward small to big search: default right */
@@ -137,6 +142,60 @@ class ColMaker: public TreeUpdater {
     // constructor
     ThreadEntry() = default;
   };
+
+
+  struct PrefixStats {
+    GradStats stats;
+    Prefix prefix;
+
+    PrefixStats() = default;
+
+    PrefixStats(const GradStats &stats_, const Prefix &prefix_)
+      : stats(stats_), prefix(prefix_) {}
+
+  };
+
+  struct ThreadPrefixStack {
+    PrefixStats pstack[kMaxPrefixLen] = {};
+
+    int top {-1};
+
+    inline bool Empty() const { return top == -1; }
+
+    inline bool CanPush(const Prefix & new_prefix) const {
+      return (top == -1) || pstack[top].prefix.Match(new_prefix);
+    }
+
+    inline PrefixStats &Top() {
+      return pstack[top];
+    }
+
+    inline const PrefixStats &Top() const {
+      return pstack[top];
+    }
+
+    inline PrefixStats Pop() {
+      return pstack[top--];
+    }
+
+    inline void Push(const PrefixStats & pstats) {
+      pstack[++top] = pstats;
+    }
+
+    inline void Clear() {
+      top = -1;
+    }
+
+    inline void Dump() const {
+      for (auto i = 0; i <= top; ++i) {
+        LOG(DEBUG) << std::string(i * 2, ' ')
+                     << pstack[i].prefix.ClearLowerBits()
+                     << "/"
+                     << 32 - pstack[i].prefix.masklen;
+      }
+    }
+  };
+
   struct NodeEntry {
     /*! \brief statics for node entry */
     GradStats stats;
@@ -241,6 +300,11 @@ class ColMaker: public TreeUpdater {
         for (auto& i : stemp_) {
           i.clear(); i.reserve(256);
         }
+        ptemp_.clear();
+        ptemp_.resize(this->ctx_->Threads(), std::vector<ThreadPrefixStack>());
+        for (auto& i : ptemp_) {
+          i.clear(); i.reserve(256);
+        }
         snode_.reserve(256);
       }
       {
@@ -261,6 +325,9 @@ class ColMaker: public TreeUpdater {
         // setup statistics space for each tree node
         for (auto& i : stemp_) {
           i.resize(tree.param.num_nodes, ThreadEntry());
+        }
+        for (auto& i : ptemp_) {
+          i.resize(tree.param.num_nodes, ThreadPrefixStack());
         }
         snode_.resize(tree.param.num_nodes, NodeEntry());
       }
@@ -308,6 +375,56 @@ class ColMaker: public TreeUpdater {
           p_newnodes->push_back(tree[nid].RightChild());
         }
       }
+    }
+
+    inline void UpdatePrefixEnumeration(
+        int nid, GradientPair gstats, bst_float fvalue, int d_step,
+        bst_uint fid, GradStats &c, std::vector<ThreadEntry> &temp, // NOLINT(*)
+        std::vector<ThreadPrefixStack> &pstack,
+        TreeEvaluator::SplitEvaluator<TrainParam> const &evaluator) const {
+      ThreadEntry &e = temp[nid];
+      ThreadPrefixStack &ps = pstack[nid];
+
+      uint32_t pvalue = static_cast<uint32_t>(fvalue);
+      Prefix p(pvalue, 0);
+
+      while (!ps.CanPush(p)) {
+        PrefixStats pl = ps.Pop();
+        // TODO: try to find a split with pstack.Top()
+        if (pl.stats.sum_hess >= param_.min_child_weight) {
+          c.SetSubstract(snode_[nid].stats, pl.stats);
+          if (c.sum_hess >= param_.min_child_weight) {
+            bst_float loss_chg = static_cast<bst_float>(
+                                                        evaluator.CalcSplitGain(param_, nid, fid, pl.stats, c) -
+                                                        snode_[nid].root_gain);
+            // HACK: encoding <prefix, masklen>
+            Prefix proposed_split = pl.prefix;
+            e.best.Update(loss_chg, fid, proposed_split,
+                          d_step == -1, pl.stats, c);
+            LOG(DEBUG) << "Finding split:"
+                       << pl.prefix.ClearLowerBits()
+                       << "/" << 32 - pl.prefix.masklen
+                       << " for node #" << nid << " feature #" << fid
+                       << " at " << &ps
+                       << " loss_chg " << loss_chg;
+          }
+        }
+        if (ps.CanPush(p)) {
+          Prefix candidate = pl.prefix.Merge(p);
+          if (candidate != ps.Top().prefix) {
+            ps.Push(PrefixStats(pl.stats, candidate));
+            break;
+          }
+        }
+        ps.Top().stats.Add(pl.stats);
+      }
+      if (ps.Empty() || ps.Top().prefix.pvalue != pvalue) {
+        ps.Push(PrefixStats(GradStats(gstats), Prefix(pvalue, 0)));
+      } else {
+        ps.Top().stats.Add(gstats);
+      }
+      e.stats.Add(gstats);
+      e.last_fvalue = fvalue;
     }
 
     // update enumeration solution
@@ -363,14 +480,17 @@ class ColMaker: public TreeUpdater {
     // same as EnumerateSplit, with cacheline prefetch optimization
     void EnumerateSplit(
         const Entry *begin, const Entry *end, int d_step, bst_uint fid,
+        bool prefix_split,
         const std::vector<GradientPair> &gpair,
         std::vector<ThreadEntry> &temp, // NOLINT(*)
+        std::vector<ThreadPrefixStack> &pstack,
         TreeEvaluator::SplitEvaluator<TrainParam> const &evaluator) const {
       CHECK(param_.cache_opt) << "Support for `cache_opt' is removed in 1.0.0";
       const std::vector<int> &qexpand = qexpand_;
       // clear all the temp statistics
       for (auto nid : qexpand) {
         temp[nid].stats = GradStats();
+        pstack[nid].Clear();
       }
       // left statistics
       GradStats c;
@@ -385,6 +505,11 @@ class ColMaker: public TreeUpdater {
       } else {
         align_end = begin - (begin - end) / kBuffer * kBuffer;
       }
+
+      // local cache buffer for prefix starting index and gradient stats
+      bst_float buf_fvalue[kBuffer] = {};
+      int buf_masklen[kBuffer] = {};
+
       int i;
       const Entry *it;
       const int align_step = d_step * kBuffer;
@@ -392,15 +517,20 @@ class ColMaker: public TreeUpdater {
       for (it = begin; it != align_end; it += align_step) {
         const Entry *p;
         for (i = 0, p = it; i < kBuffer; ++i, p += d_step) {
+          buf_fvalue[i] = p->fvalue;
           buf_position[i] = position_[p->index];
           buf_gpair[i] = gpair[p->index];
         }
         for (i = 0, p = it; i < kBuffer; ++i, p += d_step) {
           const int nid = buf_position[i];
           if (nid < 0 || !interaction_constraints_.Query(nid, fid)) { continue; }
-          this->UpdateEnumeration(nid, buf_gpair[i],
-                                  p->fvalue, d_step,
-                                  fid, c, temp, evaluator);
+          if (prefix_split) {
+            this->UpdatePrefixEnumeration(nid, buf_gpair[i], buf_fvalue[i], d_step,
+                                          fid, c, temp, pstack, evaluator);
+          } else {
+            this->UpdateEnumeration(nid, buf_gpair[i], buf_fvalue[i], d_step,
+                                    fid, c, temp, evaluator);
+          }
         }
       }
 
@@ -412,31 +542,64 @@ class ColMaker: public TreeUpdater {
       for (it = align_end, i = 0; it != end; ++i, it += d_step) {
         const int nid = buf_position[i];
         if (nid < 0 || !interaction_constraints_.Query(nid, fid)) { continue; }
-        this->UpdateEnumeration(nid, buf_gpair[i],
-                                it->fvalue, d_step,
-                                fid, c, temp, evaluator);
+        if (prefix_split) {
+          this->UpdatePrefixEnumeration(nid, buf_gpair[i], it->fvalue, d_step,
+                                        fid, c, temp, pstack, evaluator);
+        } else {
+          this->UpdateEnumeration(nid, buf_gpair[i],
+                                  it->fvalue, d_step,
+                                  fid, c, temp, evaluator);
+        }
       }
       // finish updating all statistics, check if it is possible to include all sum statistics
       for (int nid : qexpand) {
         ThreadEntry &e = temp[nid];
-        c.SetSubstract(snode_[nid].stats, e.stats);
-        if (e.stats.sum_hess >= param_.min_child_weight &&
-            c.sum_hess >= param_.min_child_weight) {
-          bst_float loss_chg;
-          const bst_float gap = std::abs(e.last_fvalue) + kRtEps;
-          const bst_float delta = d_step == +1 ? gap: -gap;
-          if (d_step == -1) {
-            loss_chg = static_cast<bst_float>(
-                evaluator.CalcSplitGain(param_, nid, fid, c, e.stats) -
-                snode_[nid].root_gain);
-            e.best.Update(loss_chg, fid, e.last_fvalue + delta, d_step == -1, c,
-                          e.stats);
-          } else {
-            loss_chg = static_cast<bst_float>(
-                evaluator.CalcSplitGain(param_, nid, fid, e.stats, c) -
-                snode_[nid].root_gain);
-            e.best.Update(loss_chg, fid, e.last_fvalue + delta, d_step == -1,
-                          e.stats, c);
+        if (prefix_split) {
+          ThreadPrefixStack &ps = pstack[nid];
+          while (!ps.Empty()) {
+            PrefixStats pl = ps.Pop();
+            if (pl.stats.sum_hess >= param_.min_child_weight) {
+              c.SetSubstract(snode_[nid].stats, pl.stats);
+              if (c.sum_hess >= param_.min_child_weight) {
+                bst_float loss_chg = static_cast<bst_float>(
+                    evaluator.CalcSplitGain(param_, nid, fid, pl.stats, c) -
+                    snode_[nid].root_gain);
+                // HACK: encoding <prefix, masklen>
+                Prefix proposed_split = pl.prefix;
+                e.best.Update(loss_chg, fid, proposed_split,
+                              d_step == -1, pl.stats, c);
+                LOG(DEBUG) << "Finding split:"
+                             << pl.prefix.ClearLowerBits()
+                             << "/" << 32 - pl.prefix.masklen
+                             << " for node #" << nid << " feature #" << fid
+                             << " at " << &ps
+                             << " loss_chg " << loss_chg;
+              }
+            }
+            if (!ps.Empty()) {
+              ps.Top().stats.Add(pl.stats);
+            }
+          }
+        } else {
+          c.SetSubstract(snode_[nid].stats, e.stats);
+          if (e.stats.sum_hess >= param_.min_child_weight &&
+              c.sum_hess >= param_.min_child_weight) {
+            bst_float loss_chg;
+            const bst_float gap = std::abs(e.last_fvalue) + kRtEps;
+            const bst_float delta = d_step == +1 ? gap: -gap;
+            if (d_step == -1) {
+              loss_chg = static_cast<bst_float>(
+                  evaluator.CalcSplitGain(param_, nid, fid, c, e.stats) -
+                  snode_[nid].root_gain);
+              e.best.Update(loss_chg, fid, e.last_fvalue + delta, d_step == -1,
+                            c, e.stats);
+            } else {
+              loss_chg = static_cast<bst_float>(
+                  evaluator.CalcSplitGain(param_, nid, fid, e.stats, c) -
+                  snode_[nid].root_gain);
+              e.best.Update(loss_chg, fid, e.last_fvalue + delta, d_step == -1,
+                            e.stats, c);
+            }
           }
         }
       }
@@ -446,9 +609,10 @@ class ColMaker: public TreeUpdater {
     virtual void UpdateSolution(const SortedCSCPage &batch,
                                 const std::vector<bst_feature_t> &feat_set,
                                 const std::vector<GradientPair> &gpair,
-                                DMatrix*) {
+                                DMatrix* p_fmat) {
       // start enumeration
       const auto num_features = static_cast<bst_omp_uint>(feat_set.size());
+      auto& feature_types = p_fmat->Info().feature_types.HostVector();
 #if defined(_OPENMP)
       CHECK(this->ctx_);
       const int batch_size =  // NOLINT
@@ -464,17 +628,27 @@ class ColMaker: public TreeUpdater {
             bst_feature_t const fid = feat_set[i];
             int32_t const tid = omp_get_thread_num();
             auto c = page[fid];
+            const bool prefix_split =
+                (colmaker_train_param_.enable_prefix_split) &&
+                (feature_types[fid] == FeatureType::kIPAddr);
+            LOG(DEBUG) << "Feature #" << fid;
+            if (prefix_split) {
+              LOG(DEBUG) << "Enable prefix splitting for feature #"
+                         << fid;
+            }
             const bool ind =
                 c.size() != 0 && c[0].fvalue == c[c.size() - 1].fvalue;
             if (colmaker_train_param_.NeedForwardSearch(
                     param_.default_direction, column_densities_[fid], ind)) {
-              this->EnumerateSplit(c.data(), c.data() + c.size(), +1, fid,
-                                  gpair, stemp_[tid], evaluator);
+              this->EnumerateSplit(c.data(), c.data() + c.size(), +1,
+                                   fid, prefix_split,
+                                   gpair, stemp_[tid], ptemp_[tid], evaluator);
             }
             if (colmaker_train_param_.NeedBackwardSearch(
                     param_.default_direction)) {
               this->EnumerateSplit(c.data() + c.size() - 1, c.data() - 1, -1,
-                                  fid, gpair, stemp_[tid], evaluator);
+                                   fid, prefix_split,
+                                   gpair, stemp_[tid], ptemp_[tid], evaluator);
             }
           });
         }
@@ -489,6 +663,7 @@ class ColMaker: public TreeUpdater {
                           RegTree *p_tree) {
       auto evaluator = tree_evaluator_.GetEvaluator();
 
+      auto& feature_types = p_fmat->Info().feature_types.HostVector();
       auto feat_set = column_sampler_.GetFeatureSet(depth);
       for (const auto &batch : p_fmat->GetBatches<SortedCSCPage>()) {
         this->UpdateSolution(batch, feat_set->HostVector(), gpair, p_fmat);
@@ -506,12 +681,31 @@ class ColMaker: public TreeUpdater {
           bst_float right_leaf_weight =
               evaluator.CalcWeight(nid, param_, e.best.right_sum) *
               param_.learning_rate;
-          p_tree->ExpandNode(nid, e.best.SplitIndex(), e.best.split_value,
-                             e.best.DefaultLeft(), e.weight, left_leaf_weight,
-                             right_leaf_weight, e.best.loss_chg,
-                             e.stats.sum_hess,
-                             e.best.left_sum.GetHess(), e.best.right_sum.GetHess(),
-                             0);
+          bst_feature_t fid = e.best.SplitIndex();
+          const bool prefix_split =
+            (colmaker_train_param_.enable_prefix_split) &&
+            (feature_types[fid] == FeatureType::kIPAddr);
+          if (prefix_split) {
+            Prefix prefix = e.best.split_prefix;
+            LOG(DEBUG) << "Finding best split:"
+                         << prefix.pvalue << "/" << 32 - prefix.masklen
+                         << " for node #" << nid << " feature #" << fid
+                         << " " << e.best.loss_chg;
+            p_tree->ExpandPrefix(nid, e.best.SplitIndex(),
+                                 prefix.pvalue, prefix.masklen,
+                                 e.best.DefaultLeft(), e.weight,
+                                 left_leaf_weight, right_leaf_weight,
+                                 e.best.loss_chg, e.stats.sum_hess,
+                                 e.best.left_sum.GetHess(),
+                                 e.best.right_sum.GetHess(), 0);
+          } else {
+            p_tree->ExpandNode(nid, e.best.SplitIndex(), e.best.split_value,
+                               e.best.DefaultLeft(), e.weight,
+                               left_leaf_weight, right_leaf_weight,
+                               e.best.loss_chg, e.stats.sum_hess,
+                               e.best.left_sum.GetHess(),
+                               e.best.right_sum.GetHess(), 0);
+          }
         } else {
           (*p_tree)[nid].SetLeaf(e.weight * param_.learning_rate);
         }
@@ -546,6 +740,8 @@ class ColMaker: public TreeUpdater {
             this->SetEncodePosition(ridx, tree[nid].RightChild());
           }
         }
+        LOG(DEBUG) << "position[" << ridx << "]"
+                     << " = " << this->DecodePosition(ridx);
       });
     }
     // customization part
@@ -571,10 +767,15 @@ class ColMaker: public TreeUpdater {
       }
       std::sort(fsplits.begin(), fsplits.end());
       fsplits.resize(std::unique(fsplits.begin(), fsplits.end()) - fsplits.begin());
+      auto& feature_types = p_fmat->Info().feature_types.HostVector();
+
       for (const auto &batch : p_fmat->GetBatches<SortedCSCPage>()) {
         auto page = batch.GetView();
         for (auto fid : fsplits) {
           auto col = page[fid];
+          const bool prefix_split =
+              (colmaker_train_param_.enable_prefix_split) &&
+              (feature_types[fid] == FeatureType::kIPAddr);
           const auto ndata = static_cast<bst_omp_uint>(col.size());
           common::ParallelFor(ndata, [&](bst_omp_uint j) {
             const bst_uint ridx = col[j].index;
@@ -582,10 +783,21 @@ class ColMaker: public TreeUpdater {
             const bst_float fvalue = col[j].fvalue;
             // go back to parent, correct those who are not default
             if (!tree[nid].IsLeaf() && tree[nid].SplitIndex() == fid) {
-              if (fvalue < tree[nid].SplitCond()) {
-                this->SetEncodePosition(ridx, tree[nid].LeftChild());
+              if (prefix_split) {
+                Prefix p(tree[nid].SplitPrefix(), tree[nid].SplitMaskLen());
+                uint32_t pvalue = static_cast<uint32_t>(fvalue);
+
+                if (p.Match(pvalue)) {
+                  this->SetEncodePosition(ridx, tree[nid].LeftChild());
+                } else {
+                  this->SetEncodePosition(ridx, tree[nid].RightChild());
+                }
               } else {
-                this->SetEncodePosition(ridx, tree[nid].RightChild());
+                if (fvalue < tree[nid].SplitCond()) {
+                  this->SetEncodePosition(ridx, tree[nid].LeftChild());
+                } else {
+                  this->SetEncodePosition(ridx, tree[nid].RightChild());
+                }
               }
             }
           });
@@ -616,6 +828,8 @@ class ColMaker: public TreeUpdater {
     std::vector<int> position_;
     // PerThread x PerTreeNode: statistics for per thread construction
     std::vector< std::vector<ThreadEntry> > stemp_;
+    // PerThread x PerTreeNode: statistics for per thread prefix construction
+    std::vector< std::vector<ThreadPrefixStack> > ptemp_;
     /*! \brief TreeNode Data: statistics for each constructed node */
     std::vector<NodeEntry> snode_;
     /*! \brief queue of nodes to be expanded */
