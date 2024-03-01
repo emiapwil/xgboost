@@ -409,8 +409,6 @@ class XGBModel(XGBModelBase):
                 "sklearn needs to be installed in order to use this module"
             )
         self.n_estimators = n_estimators
-        print("n_estimators: %d" % self.n_estimators)
-        print(enable_categorical)
 
         self.objective = objective
 
@@ -783,7 +781,6 @@ class XGBModel(XGBModelBase):
             create_dmatrix=lambda **kwargs: DMatrix(nthread=self.n_jobs, **kwargs),
             enable_categorical=self.enable_categorical,
         )
-        print(train_dmatrix.feature_types)
         params = self.get_xgb_params()
 
         if callable(self.objective):
@@ -1258,7 +1255,6 @@ class XGBClassifier(XGBModel, XGBClassifierBase):
             label_transform=label_transform,
         )
 
-        print(self.get_num_boosting_rounds())
         self._Booster = train(
             params,
             train_dmatrix,

@@ -29,6 +29,7 @@ struct ColMakerTrainParam : XGBoostParameter<ColMakerTrainParam> {
   // speed optimization for dense column
   float opt_dense_col;
   bool enable_prefix_split;
+  int max_prefix_span;
   DMLC_DECLARE_PARAMETER(ColMakerTrainParam) {
     DMLC_DECLARE_FIELD(opt_dense_col)
         .set_range(0.0f, 1.0f)
@@ -37,6 +38,9 @@ struct ColMakerTrainParam : XGBoostParameter<ColMakerTrainParam> {
     DMLC_DECLARE_FIELD(enable_prefix_split)
       .set_default(false)
       .describe("EXP Param: enable prefix-based splitting.");
+    DMLC_DECLARE_FIELD(max_prefix_span)
+      .set_default(-1)
+      .describe("EXP Param: control the length of prefix splits.");
   }
 
   /*! \brief whether need forward small to big search: default right */
@@ -378,12 +382,15 @@ class ColMaker: public TreeUpdater {
     }
 
     inline void UpdatePrefixEnumeration(
-        int nid, GradientPair gstats, bst_float fvalue, int d_step,
-        bst_uint fid, GradStats &c, std::vector<ThreadEntry> &temp, // NOLINT(*)
+        int nid, GradientPair gstats, bst_float fvalue,
+        int depth, int d_step, bst_uint fid,
+        GradStats &c, std::vector<ThreadEntry> &temp, // NOLINT(*)
         std::vector<ThreadPrefixStack> &pstack,
         TreeEvaluator::SplitEvaluator<TrainParam> const &evaluator) const {
       ThreadEntry &e = temp[nid];
       ThreadPrefixStack &ps = pstack[nid];
+
+      int min_masklen = 32 - (depth + 1) * colmaker_train_param_.max_prefix_span;
 
       uint32_t pvalue = static_cast<uint32_t>(fvalue);
       Prefix p(pvalue, 0);
@@ -395,9 +402,13 @@ class ColMaker: public TreeUpdater {
           c.SetSubstract(snode_[nid].stats, pl.stats);
           if (c.sum_hess >= param_.min_child_weight) {
             bst_float loss_chg = static_cast<bst_float>(
-                                                        evaluator.CalcSplitGain(param_, nid, fid, pl.stats, c) -
-                                                        snode_[nid].root_gain);
-            // HACK: encoding <prefix, masklen>
+                evaluator.CalcSplitGain(param_, nid, fid, pl.stats, c) -
+                snode_[nid].root_gain);
+            if (colmaker_train_param_.max_prefix_span > 0) {
+              if (pl.prefix.masklen < min_masklen) {
+                loss_chg = -1.0f;
+              }
+            }
             Prefix proposed_split = pl.prefix;
             e.best.Update(loss_chg, fid, proposed_split,
                           d_step == -1, pl.stats, c);
@@ -480,7 +491,7 @@ class ColMaker: public TreeUpdater {
     // same as EnumerateSplit, with cacheline prefetch optimization
     void EnumerateSplit(
         const Entry *begin, const Entry *end, int d_step, bst_uint fid,
-        bool prefix_split,
+        bool prefix_split, int depth,
         const std::vector<GradientPair> &gpair,
         std::vector<ThreadEntry> &temp, // NOLINT(*)
         std::vector<ThreadPrefixStack> &pstack,
@@ -525,8 +536,9 @@ class ColMaker: public TreeUpdater {
           const int nid = buf_position[i];
           if (nid < 0 || !interaction_constraints_.Query(nid, fid)) { continue; }
           if (prefix_split) {
-            this->UpdatePrefixEnumeration(nid, buf_gpair[i], buf_fvalue[i], d_step,
-                                          fid, c, temp, pstack, evaluator);
+            this->UpdatePrefixEnumeration(nid, buf_gpair[i], buf_fvalue[i],
+                                          depth, d_step, fid, c, temp, pstack,
+                                          evaluator);
           } else {
             this->UpdateEnumeration(nid, buf_gpair[i], buf_fvalue[i], d_step,
                                     fid, c, temp, evaluator);
@@ -536,6 +548,7 @@ class ColMaker: public TreeUpdater {
 
       // finish up the ending piece
       for (it = align_end, i = 0; it != end; ++i, it += d_step) {
+        buf_fvalue[i] = it->fvalue;
         buf_position[i] = position_[it->index];
         buf_gpair[i] = gpair[it->index];
       }
@@ -543,11 +556,12 @@ class ColMaker: public TreeUpdater {
         const int nid = buf_position[i];
         if (nid < 0 || !interaction_constraints_.Query(nid, fid)) { continue; }
         if (prefix_split) {
-          this->UpdatePrefixEnumeration(nid, buf_gpair[i], it->fvalue, d_step,
-                                        fid, c, temp, pstack, evaluator);
+          this->UpdatePrefixEnumeration(nid, buf_gpair[i], buf_fvalue[i],
+                                        depth, d_step, fid, c, temp, pstack,
+                                        evaluator);
         } else {
           this->UpdateEnumeration(nid, buf_gpair[i],
-                                  it->fvalue, d_step,
+                                  buf_fvalue[i], d_step,
                                   fid, c, temp, evaluator);
         }
       }
@@ -556,6 +570,7 @@ class ColMaker: public TreeUpdater {
         ThreadEntry &e = temp[nid];
         if (prefix_split) {
           ThreadPrefixStack &ps = pstack[nid];
+          int min_masklen = 32 - (depth + 1) * colmaker_train_param_.max_prefix_span;
           while (!ps.Empty()) {
             PrefixStats pl = ps.Pop();
             if (pl.stats.sum_hess >= param_.min_child_weight) {
@@ -565,6 +580,11 @@ class ColMaker: public TreeUpdater {
                     evaluator.CalcSplitGain(param_, nid, fid, pl.stats, c) -
                     snode_[nid].root_gain);
                 // HACK: encoding <prefix, masklen>
+                if (colmaker_train_param_.max_prefix_span > 0) {
+                  if (pl.prefix.masklen < min_masklen) {
+                    loss_chg = -1.0f;
+                  }
+                }
                 Prefix proposed_split = pl.prefix;
                 e.best.Update(loss_chg, fid, proposed_split,
                               d_step == -1, pl.stats, c);
@@ -606,7 +626,8 @@ class ColMaker: public TreeUpdater {
     }
 
     // update the solution candidate
-    virtual void UpdateSolution(const SortedCSCPage &batch,
+    virtual void UpdateSolution(int depth,
+                                const SortedCSCPage &batch,
                                 const std::vector<bst_feature_t> &feat_set,
                                 const std::vector<GradientPair> &gpair,
                                 DMatrix* p_fmat) {
@@ -641,13 +662,13 @@ class ColMaker: public TreeUpdater {
             if (colmaker_train_param_.NeedForwardSearch(
                     param_.default_direction, column_densities_[fid], ind)) {
               this->EnumerateSplit(c.data(), c.data() + c.size(), +1,
-                                   fid, prefix_split,
+                                   fid, prefix_split, depth,
                                    gpair, stemp_[tid], ptemp_[tid], evaluator);
             }
             if (colmaker_train_param_.NeedBackwardSearch(
                     param_.default_direction)) {
               this->EnumerateSplit(c.data() + c.size() - 1, c.data() - 1, -1,
-                                   fid, prefix_split,
+                                   fid, prefix_split, depth,
                                    gpair, stemp_[tid], ptemp_[tid], evaluator);
             }
           });
@@ -666,7 +687,7 @@ class ColMaker: public TreeUpdater {
       auto& feature_types = p_fmat->Info().feature_types.HostVector();
       auto feat_set = column_sampler_.GetFeatureSet(depth);
       for (const auto &batch : p_fmat->GetBatches<SortedCSCPage>()) {
-        this->UpdateSolution(batch, feat_set->HostVector(), gpair, p_fmat);
+        this->UpdateSolution(depth, batch, feat_set->HostVector(), gpair, p_fmat);
       }
       // after this each thread's stemp will get the best candidates, aggregate results
       this->SyncBestSolution(qexpand);
